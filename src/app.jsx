@@ -35,14 +35,14 @@ class Alpaca {
   orders(s = "all", n = 20) { return this.req(`${PROXY}/alpaca/v2/orders?status=${s}&limit=${n}`); }
   order(body) { return this.req(`${PROXY}/alpaca/v2/orders`, { method: "POST", body: JSON.stringify(body) }); }
   bars(sym, tf = "1Day", n = 200, start, end) {
-    let url = `${PROXY}/data/v2/stocks/${sym}/bars?timeframe=${tf}&limit=${n}&adjustment=split&feed=iex`;
+    let url = `${PROXY}/data/v2/stocks/${sym}/bars?timeframe=${tf}&limit=${n}&adjustment=split&feed=sip`;
     if (start) url += `&start=${start}T00:00:00Z`;
     if (end) url += `&end=${end}T23:59:59Z`;
     return this.req(url);
   }
   // Test data connection
   async testData(sym = "AAPL") {
-    const r = await this.req(`${PROXY}/data/v2/stocks/${sym}/bars?timeframe=1Day&limit=5&adjustment=split&feed=iex`);
+    const r = await this.req(`${PROXY}/data/v2/stocks/${sym}/bars?timeframe=1Day&limit=5&adjustment=split&feed=sip`);
     return r;
   }
 }
@@ -239,15 +239,30 @@ function detectATRBreakout(candles, p) {
   return sigs;
 }
 // Strategy Router
-function runStrategy(name, candles, params) {
-  const m = { "Inside Bar": detectInsideBar, "Engulfing": detectEngulfing, "Pin Bar": detectPinBar, "EMA Cross": detectEMACross, "RSI": detectRSIExtremes, "MACD": detectMACD, "Bollinger": detectBollinger, "ATR Breakout": detectATRBreakout };
-  return (m[name] || detectInsideBar)(candles, params);
+function runStrategy(nameOrId, candles, params) {
+  const byName = { "Inside Bar": detectInsideBar, "Engulfing": detectEngulfing, "Pin Bar": detectPinBar, "EMA Cross": detectEMACross, "RSI": detectRSIExtremes, "MACD": detectMACD, "Bollinger": detectBollinger, "ATR Breakout": detectATRBreakout };
+  const byId = { insideBar: detectInsideBar, engulfing: detectEngulfing, pinBar: detectPinBar, emaCross: detectEMACross, rsi: detectRSIExtremes, macd: detectMACD, bollinger: detectBollinger, atrBreak: detectATRBreakout };
+  return (byName[nameOrId] || byId[nameOrId] || detectInsideBar)(candles, params);
 }
-// Telegram notification helper
-async function sendTelegram(proxyBase, token, chatId, signal) {
+function strategyName(id) { return STRATEGIES.find(s => s.id === id)?.name || id; }
+// Telegram notification — sends alert with Approve/Reject buttons
+async function sendTelegramAlert(proxyBase, token, chatId, signal) {
   if (!token || !chatId) return;
-  const msg = `🔔 *GNZ Trading Alert*\n\n*${signal.sym || ""}* — ${signal.strategy || "Signal"}\n${signal.dir} @ $${signal.entry}\nSL: $${signal.sl} | TP: $${signal.tp}\nR:R: ${signal.rr}x\n\n_Aprueba o rechaza en la app_`;
-  try { await fetch(`${proxyBase}/api/telegram`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token, chatId, message: msg }) }); } catch {}
+  try {
+    await fetch(`${proxyBase}/api/telegram/alert`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, chatId, trade: { id: String(signal.id || Date.now()), sym: signal.sym || "", dir: signal.dir, entry: signal.entry, sl: signal.sl, tp: signal.tp, rr: signal.rr, strategy: signal.strategy || "Inside Bar", shares: "auto" } })
+    });
+  } catch {}
+}
+// Start Telegram polling for button responses
+async function startTelegramPolling(proxyBase, token, alpacaKey, alpacaSecret) {
+  try {
+    await fetch(`${proxyBase}/api/telegram/start-polling`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, alpacaKey, alpacaSecret })
+    });
+  } catch {}
 }
 // Backward compat
 function detectIB(candles, p) { return detectInsideBar(candles, p); }
@@ -495,7 +510,7 @@ const X = {
   tag: { background: T.bgLow, color: T.black, borderRadius: 2, padding: "5px 10px", fontSize: 12, fontWeight: 500, display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "'Manrope'" },
   badge: d => ({ background: d === "LONG" ? T.greenBg : d === "SHORT" ? T.redBg : T.bgLow, color: d === "LONG" ? T.green : d === "SHORT" ? T.red : T.grey, borderRadius: 2, padding: "3px 8px", fontSize: 10, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase" }),
 };
-const NAV = [{ id: "dashboard", l: "Dashboard", ic: "◈" }, { id: "trading", l: "Estrategias", ic: "↗" }, { id: "backtesting", l: "Backtesting", ic: "⟳" }, { id: "comparator", l: "Comparador", ic: "⚖" }, { id: "portfolio", l: "Portfolio", ic: "◎" }, { id: "settings", l: "Configuración", ic: "⚙" }];
+const NAV = [{ id: "dashboard", l: "Dashboard", ic: "◈" }, { id: "backtesting", l: "Backtesting", ic: "⟳" }, { id: "trading", l: "Estrategias", ic: "↗" }, { id: "comparator", l: "Comparador", ic: "⚖" }, { id: "portfolio", l: "Portfolio", ic: "◎" }, { id: "settings", l: "Configuración", ic: "⚙" }];
 
 // ════════════════════════════════════════
 // APP
@@ -534,6 +549,7 @@ export default function GNZTrading() {
   // Comparator, AI, UI
   const [scenarios, setScens] = useState([]);
   const [cSym, setCSym] = useState("AAPL");
+  const [compStrategy, setCompStrategy] = useState("insideBar");
   // Backtesting dedicated
   const [btSym, setBtSym] = useState("AAPL");
   const [btTf, setBtTf] = useState("1Day");
@@ -581,6 +597,11 @@ export default function GNZTrading() {
           const o = await c.orders("all", 15);
           setLiveOrders(o.map(x => ({ id: x.id, sym: x.symbol, side: x.side, qty: +x.qty || +x.filled_qty, status: x.status, at: x.created_at })));
         } catch {}
+
+        // 5. Start Telegram polling for approve/reject buttons
+        if (telegramCfg.enabled && telegramCfg.token) {
+          startTelegramPolling(PROXY, telegramCfg.token, keys.aK, keys.aS);
+        }
 
         return;
       }
@@ -635,7 +656,7 @@ export default function GNZTrading() {
         const trig = { id: Date.now() + Math.random(), sym, dir: s.dir, entry: s.entry, sl: s.sl, tp: s.tp, rr: s.rr, tf: par.tf, type: s.strategy || activeStrategy, ago: `Hace ${Math.floor(Math.random() * 45 + 2)} min`, status: "PENDING", strategy: s.strategy || activeStrategy };
         tg.push(trig);
         // Send Telegram notification
-        if (telegramCfg.enabled) sendTelegram(PROXY, telegramCfg.token, telegramCfg.chatId, { ...trig, sym });
+        if (telegramCfg.enabled) sendTelegramAlert(PROXY, telegramCfg.token, telegramCfg.chatId, { ...trig, sym });
       });
       setBt(backtest(candles, sigs, acct ? +acct.equity : 1e5, par.risk / 100));
       lastC = candles; lastS = sigs;
@@ -648,13 +669,20 @@ export default function GNZTrading() {
   const addSym = () => { if (nSym && !par.syms.includes(nSym.toUpperCase())) { setPar(p => ({ ...p, syms: [...p.syms, nSym.toUpperCase()] })); setNSym(""); } };
 
   // ─── AI ───
-  const getAI = async () => {
+  const getAI = async (customPrompt) => {
     setAiLoad(true);
     if (keys.aiK) {
       try {
-        const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "claude-sonnet-4-20250514", max_tokens: 1000, messages: [{ role: "user", content: `Eres asesor de inversiones. Portafolio: ${pos.map(p => `${p.sym}(${p.cat}):${p.qty}@$${p.price}`).join(";")}. Equity: $${stats.total.toLocaleString()}. Targets: ETFs 40%, Crecimiento 30%, Poder 30%. Da 3 sugerencias concretas en español.` }] }) });
-        const d = await r.json(); setAiMsgs(p => [...p, { text: d.content?.map(c => c.text || "").join("") || "Error", ts: new Date() }]);
-      } catch { setAiMsgs(p => [...p, { text: mockAI(), ts: new Date() }]); }
+        // Use server-side advisor that has direct Alpaca access
+        const r = await fetch(`${PROXY}/api/ai/advisor`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ anthropicKey: keys.aiK, alpacaKey: keys.aK, alpacaSecret: keys.aS, prompt: customPrompt || "Analiza mi portafolio y dame sugerencias de rebalanceo concretas." })
+        });
+        const d = await r.json();
+        if (d.ok) {
+          setAiMsgs(p => [...p, { text: (d.hasLiveData ? "📡 *Datos en vivo de Alpaca*\n\n" : "") + d.response, ts: new Date() }]);
+        } else { throw new Error(d.error); }
+      } catch (e) { setAiMsgs(p => [...p, { text: mockAI() + `\n\n⚠️ Error: ${e.message}`, ts: new Date() }]); }
     } else { setAiMsgs(p => [...p, { text: mockAI(), ts: new Date() }]); }
     setAiLoad(false);
   };
@@ -718,8 +746,8 @@ export default function GNZTrading() {
       dataSource = "simulated";
     }
 
-    // ── Run backtest ──
-    const sigs = detectIB(candles, par);
+    // ── Run backtest with selected strategy ──
+    const sigs = runStrategy(btStrategy, candles, par);
     sigs.forEach(s => s.sym = btSym);
     const result = backtest(candles, sigs, btCap, btRisk / 100);
 
@@ -727,24 +755,40 @@ export default function GNZTrading() {
     const endDate = candles[candles.length - 1]?.t ? new Date(candles[candles.length - 1].t).toLocaleDateString("es-MX") : btEnd;
 
     setBtDataSource(dataSource);
-    setBtFull({ ...result, symbol: btSym, timeframe: btTf, period: `${startDate} → ${endDate}`, numCandles: candles.length });
+    setBtFull({ ...result, symbol: btSym, timeframe: btTf, period: `${startDate} → ${endDate}`, numCandles: candles.length, strategy: btStrategy });
     setBtRunning(false);
-  }, [btSym, btTf, btCap, btRisk, btBars, btStart, btEnd, btPeriodMode, par]);
+  }, [btSym, btTf, btCap, btRisk, btBars, btStart, btEnd, btPeriodMode, par, btStrategy]);
 
   // ─── Comparator ───
   const compare = useCallback(async () => {
+    const selName = strategyName(compStrategy);
     const cfgs = [{ l: "Conservador", atrP: 14, slM: 2, tpM: 2, volF: true, conf: true, minB: .7 }, { l: "Equilibrado", atrP: 14, slM: 1.5, tpM: 3, volF: true, conf: true, minB: .5 }, { l: "Agresivo", atrP: 10, slM: 1, tpM: 4, volF: false, conf: false, minB: .3 }, { l: "Scalper", atrP: 7, slM: .8, tpM: 1.6, volF: false, conf: false, minB: .2 }];
+
+    // 1. By Timeframe (selected strategy)
     const byTf = [];
     for (const tf of TFS.filter(t => ["1Hour", "4Hour", "1Day", "1Week"].includes(t.v))) {
       let c; if (client.current) { try { const d = await client.current.bars(cSym, tf.v, 200); if (d.bars?.length > 10) c = d.bars.map(b => ({ t: b.t, o: +b.o, h: +b.h, l: +b.l, c: +b.c, v: +b.v })); } catch {} }
       if (!c) c = simCandles(cSym, 200, tf.v);
-      const s = detectIB(c, par); byTf.push({ label: tf.l, ...backtest(c, s) });
+      const s = runStrategy(compStrategy, c, par); byTf.push({ label: tf.l, ...backtest(c, s) });
     }
+
+    // 2. By Parametrization (selected strategy)
     let bc; if (client.current) { try { const d = await client.current.bars(cSym, "1Day", 200); if (d.bars?.length > 10) bc = d.bars.map(b => ({ t: b.t, o: +b.o, h: +b.h, l: +b.l, c: +b.c, v: +b.v })); } catch {} }
     if (!bc) bc = simCandles(cSym, 200, "1Day");
-    const byP = cfgs.map(cfg => { const s = detectIB(bc, cfg); return { label: cfg.l, ...backtest(bc, s) }; });
-    setScens([{ g: "Por Timeframe", items: byTf }, { g: "Por Parametrización", items: byP }]);
-  }, [cSym, par]);
+    const byP = cfgs.map(cfg => { const s = runStrategy(compStrategy, bc, cfg); return { label: cfg.l, ...backtest(bc, s) }; });
+
+    // 3. By Strategy (all strategies, same data, same params)
+    const byStrat = STRATEGIES.map(strat => {
+      const s = runStrategy(strat.id, bc, par);
+      return { label: strat.name, ...backtest(bc, s) };
+    });
+
+    setScens([
+      { g: `${selName} — Por Timeframe`, items: byTf },
+      { g: `${selName} — Por Parametrización`, items: byP },
+      { g: `Todas las Estrategias — ${cSym} 1Day`, items: byStrat },
+    ]);
+  }, [cSym, par, compStrategy]);
 
   // ─── Stats ───
   const stats = useMemo(() => {
@@ -931,7 +975,18 @@ export default function GNZTrading() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 24 }}>
             <div>
               <div style={{ ...X.serif, fontSize: 32, fontWeight: 700 }}>Backtesting <span style={{ fontStyle: "italic" }}>Engine</span></div>
-              <p style={{ fontSize: 13, color: T.grey, marginTop: 4 }}>Simulación histórica de la estrategia Inside Bar{conn ? " con datos reales" : ""}</p>
+              <p style={{ fontSize: 13, color: T.grey, marginTop: 4 }}>Simulación histórica de estrategias{conn ? " con datos reales" : ""}</p>
+            </div>
+          </div>
+
+          {/* Strategy Selector */}
+          <div style={{ ...X.card, marginBottom: 12 }}>
+            <div style={{ ...X.lbl, marginBottom: 8 }}>Estrategia</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {STRATEGIES.map(s => <button key={s.id} style={X.chip(btStrategy === s.name)} onClick={() => setBtStrategy(s.name)}>
+                <span style={{ fontSize: 11 }}>{s.name}</span>
+                <span style={{ fontSize: 9, color: btStrategy === s.name ? "rgba(255,255,255,.6)" : T.muted, marginLeft: 4 }}>{s.cat}</span>
+              </button>)}
             </div>
           </div>
 
@@ -1169,9 +1224,16 @@ export default function GNZTrading() {
 
         {/* ████ COMPARATOR ████ */}
         {tab === "comparator" && (<div>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 24 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
             <div><div style={{ ...X.serif, fontSize: 32, fontWeight: 700 }}>Comparador de <span style={{ fontStyle: "italic" }}>Escenarios</span></div></div>
-            <div style={{ display: "flex", gap: 8 }}><input style={{ ...X.inp, width: 100 }} value={cSym} onChange={e => setCSym(e.target.value.toUpperCase())} /><button style={X.bg} onClick={compare}>⚡ Comparar</button></div>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}><input style={{ ...X.inp, width: 100 }} value={cSym} onChange={e => setCSym(e.target.value.toUpperCase())} placeholder="Símbolo" /><button style={X.bg} onClick={compare}>⚡ Comparar</button></div>
+          </div>
+          {/* Strategy selector for comparator */}
+          <div style={{ ...X.card, marginBottom: 16 }}>
+            <div style={{ ...X.lbl, marginBottom: 8 }}>Estrategia a Comparar</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {STRATEGIES.map(s => <button key={s.id} style={X.chip(compStrategy === s.id)} onClick={() => setCompStrategy(s.id)}>{s.name}</button>)}
+            </div>
           </div>
           {!scenarios.length && <div style={{ ...X.card, textAlign: "center", padding: 60, color: T.grey }}><div style={{ fontSize: 48, marginBottom: 12 }}>⚖</div><div>Elige un símbolo y compara</div></div>}
           {scenarios.map((g, gi) => <div key={gi} style={{ marginBottom: 32 }}>
