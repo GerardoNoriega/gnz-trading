@@ -35,14 +35,14 @@ class Alpaca {
   orders(s = "all", n = 20) { return this.req(`${PROXY}/alpaca/v2/orders?status=${s}&limit=${n}`); }
   order(body) { return this.req(`${PROXY}/alpaca/v2/orders`, { method: "POST", body: JSON.stringify(body) }); }
   bars(sym, tf = "1Day", n = 200, start, end) {
-    let url = `${PROXY}/data/v2/stocks/${sym}/bars?timeframe=${tf}&limit=${n}&adjustment=split`;
+    let url = `${PROXY}/data/v2/stocks/${sym}/bars?timeframe=${tf}&limit=${n}&adjustment=split&feed=iex`;
     if (start) url += `&start=${start}T00:00:00Z`;
     if (end) url += `&end=${end}T23:59:59Z`;
     return this.req(url);
   }
   // Test data connection
   async testData(sym = "AAPL") {
-    const r = await this.req(`${PROXY}/data/v2/stocks/${sym}/bars?timeframe=1Day&limit=5&adjustment=split`);
+    const r = await this.req(`${PROXY}/data/v2/stocks/${sym}/bars?timeframe=1Day&limit=5&adjustment=split&feed=iex`);
     return r;
   }
 }
