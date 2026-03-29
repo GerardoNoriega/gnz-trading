@@ -83,32 +83,175 @@ function simPositions() {
 }
 
 // ════════════════════════════════════════
-// INSIDE BAR ENGINE
+// STRATEGY HELPERS
 // ════════════════════════════════════════
-function detectIB(candles, p) {
-  const sigs = [], atrs = [];
+function calcATR(candles, period = 14) {
+  const atrs = [];
   for (let i = 1; i < candles.length; i++) atrs.push(Math.max(candles[i].h - candles[i].l, Math.abs(candles[i].h - candles[i - 1].c), Math.abs(candles[i].l - candles[i - 1].c)));
-  const atr = i => { const s = atrs.slice(Math.max(0, i - p.atrP), i); return s.length ? s.reduce((a, b) => a + b) / s.length : 0; };
+  return (idx) => { const s = atrs.slice(Math.max(0, idx - period), idx); return s.length ? s.reduce((a, b) => a + b) / s.length : 0; };
+}
+function calcEMA(vals, period) {
+  const ema = [], k = 2 / (period + 1);
+  vals.forEach((v, i) => ema.push(i === 0 ? v : v * k + ema[i - 1] * (1 - k)));
+  return ema;
+}
+function calcRSI(candles, period = 14) {
+  const rsi = new Array(candles.length).fill(50);
+  let avgG = 0, avgL = 0;
+  for (let i = 1; i <= period && i < candles.length; i++) { const d = candles[i].c - candles[i - 1].c; if (d > 0) avgG += d; else avgL -= d; }
+  avgG /= period; avgL /= period;
+  for (let i = period + 1; i < candles.length; i++) {
+    const d = candles[i].c - candles[i - 1].c;
+    avgG = (avgG * (period - 1) + (d > 0 ? d : 0)) / period;
+    avgL = (avgL * (period - 1) + (d < 0 ? -d : 0)) / period;
+    rsi[i] = 100 - 100 / (1 + (avgL > 0 ? avgG / avgL : 100));
+  }
+  return rsi;
+}
+function calcBollinger(candles, period = 20, mult = 2) {
+  const u = [], l = [], m = [];
+  for (let i = 0; i < candles.length; i++) {
+    const sl = candles.slice(Math.max(0, i - period + 1), i + 1).map(c => c.c);
+    const avg = sl.reduce((a, b) => a + b) / sl.length;
+    const std = Math.sqrt(sl.reduce((a, v) => a + (v - avg) ** 2, 0) / sl.length);
+    m.push(avg); u.push(avg + mult * std); l.push(avg - mult * std);
+  }
+  return { upper: u, lower: l, mid: m };
+}
+
+// ════════════════════════════════════════
+// ALL STRATEGIES — same signal format
+// ════════════════════════════════════════
+const STRATEGIES = [
+  { id: "insideBar", name: "Inside Bar", cat: "Price Action", desc: "Compresión de volatilidad dentro de vela madre" },
+  { id: "engulfing", name: "Engulfing", cat: "Price Action", desc: "Vela envolvente, señal de reversión" },
+  { id: "pinBar", name: "Pin Bar", cat: "Price Action", desc: "Mecha larga, rechazo de nivel" },
+  { id: "emaCross", name: "EMA Cross", cat: "Momentum", desc: "Cruce de medias móviles 9/21" },
+  { id: "rsi", name: "RSI Extremes", cat: "Momentum", desc: "Sobrecompra/sobreventa con confirmación" },
+  { id: "macd", name: "MACD", cat: "Momentum", desc: "Cruce de línea MACD y señal" },
+  { id: "bollinger", name: "Bollinger Squeeze", cat: "Volatilidad", desc: "Compresión y explosión de bandas" },
+  { id: "atrBreak", name: "ATR Breakout", cat: "Volatilidad", desc: "Ruptura por encima de 1.5x ATR" },
+];
+
+const RISK_DEFAULTS = {
+  trailingSL: true, trailPct: 1.5,
+  maxDailyLoss: true, maxDailyPct: 5,
+  maxConsecLosses: true, maxConsec: 3,
+  positionCap: true, posPct: 50,
+  breakEven: true, breakEvenPct: 1.5,
+};
+
+function detectInsideBar(candles, p) {
+  const sigs = [], atr = calcATR(candles, p.atrP);
   const avgV = (i, n = 20) => { const s = candles.slice(Math.max(0, i - n), i); return s.length ? s.reduce((a, b) => a + b.v, 0) / s.length : 0; };
   for (let i = 2; i < candles.length; i++) {
     const m = candles[i - 1], ins = candles[i];
     if (!(ins.h <= m.h && ins.l >= m.l)) continue;
-    const a = atr(i);
-    if (p.minB > 0 && (m.h - m.l) < a * p.minB) continue;
+    const a = atr(i); if (p.minB > 0 && (m.h - m.l) < a * p.minB) continue;
     if (p.volF && m.v < avgV(i) * .8) continue;
     if (p.conf && i + 1 < candles.length) {
       const cf = candles[i + 1], up = cf.c > m.h, dn = cf.c < m.l;
       if (!up && !dn) continue;
       const d = up ? "LONG" : "SHORT", e = up ? m.h : m.l;
-      sigs.push({ idx: i, ts: ins.t, dir: d, entry: +e.toFixed(2), sl: +(d === "LONG" ? e - a * p.slM : e + a * p.slM).toFixed(2), tp: +(d === "LONG" ? e + a * p.tpM : e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: m.h, ml: m.l });
+      sigs.push({ idx: i, ts: ins.t, dir: d, entry: +e.toFixed(2), sl: +(d === "LONG" ? e - a * p.slM : e + a * p.slM).toFixed(2), tp: +(d === "LONG" ? e + a * p.tpM : e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: m.h, ml: m.l, strategy: "Inside Bar" });
     } else if (!p.conf) {
       const d = m.c > m.o ? "LONG" : "SHORT", e = d === "LONG" ? m.h : m.l;
-      sigs.push({ idx: i, ts: ins.t, dir: d, entry: +e.toFixed(2), sl: +(d === "LONG" ? e - a * p.slM : e + a * p.slM).toFixed(2), tp: +(d === "LONG" ? e + a * p.tpM : e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: m.h, ml: m.l });
+      sigs.push({ idx: i, ts: ins.t, dir: d, entry: +e.toFixed(2), sl: +(d === "LONG" ? e - a * p.slM : e + a * p.slM).toFixed(2), tp: +(d === "LONG" ? e + a * p.tpM : e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: m.h, ml: m.l, strategy: "Inside Bar" });
     }
   }
   return sigs;
 }
-function backtest(candles, sigs, cap = 1e5, risk = .02) {
+function detectEngulfing(candles, p) {
+  const sigs = [], atr = calcATR(candles, p.atrP);
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1], curr = candles[i], a = atr(i); if (!a) continue;
+    if (prev.c < prev.o && curr.c > curr.o && curr.o <= prev.c && curr.c >= prev.o) {
+      const e = curr.c; sigs.push({ idx: i, ts: curr.t, dir: "LONG", entry: +e.toFixed(2), sl: +(e - a * p.slM).toFixed(2), tp: +(e + a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: curr.h, ml: curr.l, strategy: "Engulfing" });
+    }
+    if (prev.c > prev.o && curr.c < curr.o && curr.o >= prev.c && curr.c <= prev.o) {
+      const e = curr.c; sigs.push({ idx: i, ts: curr.t, dir: "SHORT", entry: +e.toFixed(2), sl: +(e + a * p.slM).toFixed(2), tp: +(e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: curr.h, ml: curr.l, strategy: "Engulfing" });
+    }
+  }
+  return sigs;
+}
+function detectPinBar(candles, p) {
+  const sigs = [], atr = calcATR(candles, p.atrP);
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i], a = atr(i); if (!a) continue;
+    const body = Math.abs(c.c - c.o), range = c.h - c.l; if (range < a * 0.3) continue;
+    const lw = Math.min(c.o, c.c) - c.l, uw = c.h - Math.max(c.o, c.c);
+    if (lw > range * 0.6 && body < range * 0.3) { const e = c.c; sigs.push({ idx: i, ts: c.t, dir: "LONG", entry: +e.toFixed(2), sl: +(c.l - a * 0.2).toFixed(2), tp: +(e + a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: c.h, ml: c.l, strategy: "Pin Bar" }); }
+    if (uw > range * 0.6 && body < range * 0.3) { const e = c.c; sigs.push({ idx: i, ts: c.t, dir: "SHORT", entry: +e.toFixed(2), sl: +(c.h + a * 0.2).toFixed(2), tp: +(e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: c.h, ml: c.l, strategy: "Pin Bar" }); }
+  }
+  return sigs;
+}
+function detectEMACross(candles, p) {
+  const sigs = [], closes = candles.map(c => c.c), fast = calcEMA(closes, p.emaFast || 9), slow = calcEMA(closes, p.emaSlow || 21), atr = calcATR(candles, p.atrP);
+  for (let i = 2; i < candles.length; i++) {
+    const a = atr(i); if (!a) continue;
+    if (fast[i] > slow[i] && fast[i - 1] <= slow[i - 1]) { const e = candles[i].c; sigs.push({ idx: i, ts: candles[i].t, dir: "LONG", entry: +e.toFixed(2), sl: +(e - a * p.slM).toFixed(2), tp: +(e + a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "EMA Cross" }); }
+    if (fast[i] < slow[i] && fast[i - 1] >= slow[i - 1]) { const e = candles[i].c; sigs.push({ idx: i, ts: candles[i].t, dir: "SHORT", entry: +e.toFixed(2), sl: +(e + a * p.slM).toFixed(2), tp: +(e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "EMA Cross" }); }
+  }
+  return sigs;
+}
+function detectRSIExtremes(candles, p) {
+  const sigs = [], rsi = calcRSI(candles, p.rsiPeriod || 14), atr = calcATR(candles, p.atrP);
+  const os = p.rsiOS || 30, ob = p.rsiOB || 70;
+  for (let i = 2; i < candles.length; i++) {
+    const a = atr(i); if (!a) continue;
+    if (rsi[i] > os && rsi[i - 1] <= os) { const e = candles[i].c; sigs.push({ idx: i, ts: candles[i].t, dir: "LONG", entry: +e.toFixed(2), sl: +(e - a * p.slM).toFixed(2), tp: +(e + a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "RSI" }); }
+    if (rsi[i] < ob && rsi[i - 1] >= ob) { const e = candles[i].c; sigs.push({ idx: i, ts: candles[i].t, dir: "SHORT", entry: +e.toFixed(2), sl: +(e + a * p.slM).toFixed(2), tp: +(e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "RSI" }); }
+  }
+  return sigs;
+}
+function detectMACD(candles, p) {
+  const sigs = [], closes = candles.map(c => c.c), ema12 = calcEMA(closes, 12), ema26 = calcEMA(closes, 26);
+  const macdL = ema12.map((v, i) => v - ema26[i]), sigL = calcEMA(macdL, 9), atr = calcATR(candles, p.atrP);
+  for (let i = 2; i < candles.length; i++) {
+    const a = atr(i); if (!a) continue;
+    if (macdL[i] > sigL[i] && macdL[i - 1] <= sigL[i - 1]) { const e = candles[i].c; sigs.push({ idx: i, ts: candles[i].t, dir: "LONG", entry: +e.toFixed(2), sl: +(e - a * p.slM).toFixed(2), tp: +(e + a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "MACD" }); }
+    if (macdL[i] < sigL[i] && macdL[i - 1] >= sigL[i - 1]) { const e = candles[i].c; sigs.push({ idx: i, ts: candles[i].t, dir: "SHORT", entry: +e.toFixed(2), sl: +(e + a * p.slM).toFixed(2), tp: +(e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "MACD" }); }
+  }
+  return sigs;
+}
+function detectBollinger(candles, p) {
+  const sigs = [], { upper, lower, mid } = calcBollinger(candles, 20, 2), atr = calcATR(candles, p.atrP);
+  for (let i = 21; i < candles.length; i++) {
+    const a = atr(i); if (!a) continue;
+    const bw = (upper[i] - lower[i]) / mid[i], pbw = (upper[i - 1] - lower[i - 1]) / mid[i - 1];
+    if (pbw < 0.06 && bw > pbw * 1.2) {
+      const dir = candles[i].c > mid[i] ? "LONG" : "SHORT", e = candles[i].c;
+      sigs.push({ idx: i, ts: candles[i].t, dir, entry: +e.toFixed(2), sl: +(dir === "LONG" ? e - a * p.slM : e + a * p.slM).toFixed(2), tp: +(dir === "LONG" ? e + a * p.tpM : e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "Bollinger" });
+    }
+  }
+  return sigs;
+}
+function detectATRBreakout(candles, p) {
+  const sigs = [], atr = calcATR(candles, p.atrP);
+  for (let i = 2; i < candles.length; i++) {
+    const a = atr(i); if (!a) continue;
+    const move = Math.abs(candles[i].c - candles[i - 1].c);
+    if (move > a * 1.5) {
+      const dir = candles[i].c > candles[i - 1].c ? "LONG" : "SHORT", e = candles[i].c;
+      sigs.push({ idx: i, ts: candles[i].t, dir, entry: +e.toFixed(2), sl: +(dir === "LONG" ? e - a * p.slM : e + a * p.slM).toFixed(2), tp: +(dir === "LONG" ? e + a * p.tpM : e - a * p.tpM).toFixed(2), rr: +(p.tpM / p.slM).toFixed(2), mh: candles[i].h, ml: candles[i].l, strategy: "ATR Breakout" });
+    }
+  }
+  return sigs;
+}
+// Strategy Router
+function runStrategy(name, candles, params) {
+  const m = { "Inside Bar": detectInsideBar, "Engulfing": detectEngulfing, "Pin Bar": detectPinBar, "EMA Cross": detectEMACross, "RSI": detectRSIExtremes, "MACD": detectMACD, "Bollinger": detectBollinger, "ATR Breakout": detectATRBreakout };
+  return (m[name] || detectInsideBar)(candles, params);
+}
+// Telegram notification helper
+async function sendTelegram(proxyBase, token, chatId, signal) {
+  if (!token || !chatId) return;
+  const msg = `🔔 *GNZ Trading Alert*\n\n*${signal.sym || ""}* — ${signal.strategy || "Signal"}\n${signal.dir} @ $${signal.entry}\nSL: $${signal.sl} | TP: $${signal.tp}\nR:R: ${signal.rr}x\n\n_Aprueba o rechaza en la app_`;
+  try { await fetch(`${proxyBase}/api/telegram`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token, chatId, message: msg }) }); } catch {}
+}
+// Backward compat
+function detectIB(candles, p) { return detectInsideBar(candles, p); }
+function backtest(candles, sigs, cap = 1e5, risk = .02, maxHoldBars = 50) {
   let c = cap, w = 0, lo = 0, mx = cap, md = 0;
   const eq = [{ x: 0, y: c }];
   const trades = [];
@@ -117,46 +260,85 @@ function backtest(candles, sigs, cap = 1e5, risk = .02) {
 
   sigs.forEach((s, i) => {
     const sd = Math.abs(s.entry - s.sl); if (!sd) return;
-    const sz = Math.floor(c * risk / sd); if (!sz) return;
-    let h = null, exitPrice = s.entry;
-    const end = Math.min(s.idx + 10, candles.length - 1);
+    // Position size based on risk per trade
+    const riskAmt = c * risk;
+    const sz = Math.floor(riskAmt / sd);
+    if (!sz || sz < 1) return;
+    // Cap position value to 50% of capital (safety)
+    const maxShares = Math.floor(c * 0.5 / s.entry);
+    const posSize = Math.min(sz, maxShares);
+    if (posSize < 1) return;
+
+    let h = null, exitPrice = s.entry, exitBar = -1;
+    const end = Math.min(s.idx + maxHoldBars, candles.length - 1);
+
+    // Scan forward for SL or TP hit
     for (let j = s.idx + 1; j <= end; j++) {
       const k = candles[j];
       if (s.dir === "LONG") {
-        if (k.l <= s.sl) { h = "SL"; exitPrice = s.sl; break; }
-        if (k.h >= s.tp) { h = "TP"; exitPrice = s.tp; break; }
+        // Check SL first (worst case)
+        if (k.l <= s.sl) { h = "SL"; exitPrice = s.sl; exitBar = j; break; }
+        if (k.h >= s.tp) { h = "TP"; exitPrice = s.tp; exitBar = j; break; }
       } else {
-        if (k.h >= s.sl) { h = "SL"; exitPrice = s.sl; break; }
-        if (k.l <= s.tp) { h = "TP"; exitPrice = s.tp; break; }
+        if (k.h >= s.sl) { h = "SL"; exitPrice = s.sl; exitBar = j; break; }
+        if (k.l <= s.tp) { h = "TP"; exitPrice = s.tp; exitBar = j; break; }
       }
     }
-    if (!h) { h = Math.random() > .5 ? "TP" : "SL"; exitPrice = h === "TP" ? s.tp : s.sl; }
 
-    const pnlAbs = s.dir === "LONG"
-      ? sz * (exitPrice - s.entry)
-      : sz * (s.entry - exitPrice);
-    const pnlPct = +((exitPrice - s.entry) / s.entry * 100 * (s.dir === "LONG" ? 1 : -1)).toFixed(2);
+    // If neither SL nor TP hit: close at actual close price of last bar (NO random)
+    if (!h) {
+      const lastBar = candles[end] || candles[candles.length - 1];
+      exitPrice = lastBar.c;
+      exitBar = end;
+      // Determine if it was a win or loss based on actual P&L
+      if (s.dir === "LONG") {
+        h = exitPrice > s.entry ? "WIN" : "LOSS";
+      } else {
+        h = exitPrice < s.entry ? "WIN" : "LOSS";
+      }
+    }
 
-    c += pnlAbs;
-    h === "TP" ? (w++, totalProfitFromWins += pnlAbs) : (lo++, totalLossFromLosses += Math.abs(pnlAbs));
+    // Calculate P&L
+    const pnlPerShare = s.dir === "LONG"
+      ? (exitPrice - s.entry)
+      : (s.entry - exitPrice);
+    const pnlAbs = +(posSize * pnlPerShare).toFixed(2);
+    const pnlPricePct = +((exitPrice - s.entry) / s.entry * 100 * (s.dir === "LONG" ? 1 : -1)).toFixed(2);
+    const pnlPortfolioPct = +(pnlAbs / c * 100).toFixed(2);
+
+    c = +(c + pnlAbs).toFixed(2);
+
+    const isWin = h === "TP" || h === "WIN";
+    if (isWin) { w++; totalProfitFromWins += Math.max(0, pnlAbs); }
+    else { lo++; totalLossFromLosses += Math.abs(Math.min(0, pnlAbs)); }
+
     mx = Math.max(mx, c);
-    const curDD = -((mx - c) / mx * 100);
-    md = Math.max(md, (mx - c) / mx);
+    const curDD = mx > 0 ? -((mx - c) / mx * 100) : 0;
+    md = Math.max(md, mx > 0 ? (mx - c) / mx : 0);
 
-    eq.push({ x: i + 1, y: +c.toFixed(2) });
-    ddCurve.push({ x: i + 1, y: +curDD.toFixed(2) });
+    eq.push({ x: i + 1, y: c, t: s.ts });
+    ddCurve.push({ x: i + 1, y: +curDD.toFixed(2), t: s.ts });
+
+    const barsHeld = exitBar > 0 ? exitBar - s.idx : 0;
+    const exitDate = exitBar > 0 && candles[exitBar] ? candles[exitBar].t : s.ts;
 
     trades.push({
       num: trades.length + 1,
       date: s.ts,
+      exitDate,
       type: s.dir === "LONG" ? "BUY" : "SELL",
       entry: s.entry,
       exit: +exitPrice.toFixed(2),
-      pnlPct,
-      capital: +c.toFixed(2),
+      sl: s.sl,
+      tp: s.tp,
+      pnlPct: pnlPricePct,
+      pnlPortPct: pnlPortfolioPct,
+      pnlAbs,
+      capital: c,
       drawdown: +curDD.toFixed(2),
       result: h,
-      size: sz,
+      size: posSize,
+      barsHeld,
       sym: s.sym || "",
     });
   });
@@ -164,14 +346,14 @@ function backtest(candles, sigs, cap = 1e5, risk = .02) {
   const tot = w + lo;
   const avgWin = w > 0 ? totalProfitFromWins / w : 0;
   const avgLoss = lo > 0 ? totalLossFromLosses / lo : 0;
-  const pf = avgLoss > 0 ? +(totalProfitFromWins / totalLossFromLosses).toFixed(2) : 0;
+  const pf = totalLossFromLosses > 0 ? +(totalProfitFromWins / totalLossFromLosses).toFixed(2) : (totalProfitFromWins > 0 ? 999 : 0);
   const expectancy = tot > 0 ? +((totalProfitFromWins - totalLossFromLosses) / tot).toFixed(2) : 0;
 
-  // Sharpe approximation
-  const rets = eq.slice(1).map((e, i) => (e.y - eq[i].y) / eq[i].y);
+  // Sharpe ratio
+  const rets = eq.slice(1).map((e, i) => eq[i].y > 0 ? (e.y - eq[i].y) / eq[i].y : 0);
   const mu = rets.length ? rets.reduce((a, b) => a + b) / rets.length : 0;
-  const std = rets.length ? Math.sqrt(rets.reduce((a, r) => a + (r - mu) ** 2, 0) / rets.length) : 0;
-  const sharpe = std > 0 ? +(mu / std * Math.sqrt(252)).toFixed(2) : 0;
+  const std = rets.length > 1 ? Math.sqrt(rets.reduce((a, r) => a + (r - mu) ** 2, 0) / (rets.length - 1)) : 0;
+  const sharpe = std > 0 ? +(mu / std * Math.sqrt(Math.min(252, tot))).toFixed(2) : 0;
 
   return {
     tot, w, lo,
@@ -179,8 +361,9 @@ function backtest(candles, sigs, cap = 1e5, risk = .02) {
     md: +(md * 100).toFixed(1),
     ret: +((c - cap) / cap * 100).toFixed(2),
     sharpe, pf, expectancy,
-    cap0: cap, capF: +c.toFixed(2),
+    cap0: cap, capF: c,
     avgWin: +avgWin.toFixed(2), avgLoss: +avgLoss.toFixed(2),
+    avgBarsHeld: tot > 0 ? +(trades.reduce((a, t) => a + t.barsHeld, 0) / tot).toFixed(1) : 0,
     eq, ddCurve, trades,
   };
 }
@@ -197,32 +380,101 @@ function Donut({ segs, size = 160, sw = 18, center }) {
     {center && <text x={cx} y={cx + 12} textAnchor="middle" fill={T.black} fontSize={18} fontFamily="'Noto Serif'" fontWeight={700}>{center}</text>}
   </svg>);
 }
-function LineChart({ data, w, h, color, area = true }) {
+function LineChart({ data, w, h, color, area = true, showDates = false }) {
   if (!data?.length) return null;
   const vals = data.map(d => typeof d === "number" ? d : d.y);
+  const dates = showDates ? data.map(d => d.t || d.x || "") : [];
   const mn = Math.min(...vals), mx = Math.max(...vals), rng = mx - mn || 1;
-  const pts = vals.map((v, i) => `${i / (vals.length - 1) * w},${h - 4 - (v - mn) / rng * (h - 8)}`).join(" ");
+  const padL = showDates ? 50 : 0, padB = showDates ? 20 : 0;
+  const cw = w - padL, ch = h - padB;
+  const pts = vals.map((v, i) => `${padL + i / (vals.length - 1) * cw},${ch - 4 - (v - mn) / rng * (ch - 8)}`).join(" ");
   const col = color || (vals[vals.length - 1] >= vals[0] ? T.green : T.red);
-  const id = `g${w}${h}${col.replace('#','')}`;
+  const id = `g${w}${h}${col.replace('#','')}${Math.random().toString(36).slice(2,6)}`;
+  // Date labels (show ~5 evenly spaced)
+  const dateLabels = [];
+  if (showDates && dates.length > 0) {
+    const step = Math.max(1, Math.floor(dates.length / 5));
+    for (let i = 0; i < dates.length; i += step) {
+      const d = dates[i]; if (!d) continue;
+      const dt = typeof d === "string" ? new Date(d) : new Date();
+      dateLabels.push({ x: padL + i / (vals.length - 1) * cw, label: dt.toLocaleDateString("es-MX", { month: "short", day: "numeric" }) });
+    }
+  }
+  // Y-axis labels
+  const yLabels = showDates ? [mn, mn + rng * 0.5, mx].map(v => ({ y: ch - 4 - (v - mn) / rng * (ch - 8), label: v >= 1000 ? `$${(v/1000).toFixed(0)}k` : `$${v.toFixed(0)}` })) : [];
+
   return (<svg width={w} height={h} style={{ display: "block" }}>
-    {area && <><defs><linearGradient id={id} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={col} stopOpacity=".12" /><stop offset="100%" stopColor={col} stopOpacity="0" /></linearGradient></defs><polygon points={`0,${h} ${pts} ${w},${h}`} fill={`url(#${id})`} /></>}
+    {area && <><defs><linearGradient id={id} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={col} stopOpacity=".12" /><stop offset="100%" stopColor={col} stopOpacity="0" /></linearGradient></defs><polygon points={`${padL},${ch} ${pts} ${w},${ch}`} fill={`url(#${id})`} /></>}
     <polyline points={pts} fill="none" stroke={col} strokeWidth={1.5} />
+    {yLabels.map((yl, i) => <text key={i} x={2} y={yl.y + 3} fill={T.muted} fontSize={9} fontFamily="Manrope">{yl.label}</text>)}
+    {dateLabels.map((dl, i) => <text key={i} x={dl.x} y={h - 2} fill={T.muted} fontSize={8} fontFamily="Manrope" textAnchor="middle">{dl.label}</text>)}
   </svg>);
 }
 function CandleChart({ candles, signals = [], w = 700, h = 280 }) {
+  const [hover, setHover] = useState(null);
   const disp = candles.slice(-100);
   const mn = Math.min(...disp.map(c => c.l)) * .999, mx = Math.max(...disp.map(c => c.h)) * 1.001, rng = mx - mn;
-  const bw = Math.max(3, (w - 40) / disp.length - 1);
-  const toY = p => h - 20 - ((p - mn) / rng) * (h - 40);
+  const padL = 55, padB = 24;
+  const cw = w - padL, ch = h - padB;
+  const bw = Math.max(3, cw / disp.length - 1);
+  const toY = p => ch - ((p - mn) / rng) * ch;
   const si = candles.length - 100;
-  return (<svg width={w} height={h} style={{ display: "block", background: T.white, borderRadius: 2 }}>
-    {[.25, .5, .75].map(f => { const y = 20 + f * (h - 40), p = mx - f * rng; return <g key={f}><line x1={40} y1={y} x2={w} y2={y} stroke={T.ghost} /><text x={4} y={y + 3} fill={T.muted} fontSize={9} fontFamily="Manrope">${p.toFixed(0)}</text></g>; })}
+
+  // Date labels (~8 evenly spaced)
+  const dateStep = Math.max(1, Math.floor(disp.length / 8));
+  const dateLabels = [];
+  for (let i = 0; i < disp.length; i += dateStep) {
+    if (disp[i]?.t) {
+      const dt = new Date(disp[i].t);
+      dateLabels.push({ x: padL + i * (bw + 1) + bw / 2, label: dt.toLocaleDateString("es-MX", { month: "short", day: "numeric" }) });
+    }
+  }
+  // Y-axis price labels
+  const ySteps = 5;
+  const yLabels = Array.from({ length: ySteps + 1 }, (_, i) => {
+    const price = mn + (rng * i / ySteps);
+    return { y: toY(price), label: `$${price.toFixed(price > 100 ? 0 : 2)}` };
+  });
+
+  return (<svg width={w} height={h} style={{ display: "block", background: T.white, borderRadius: 2 }}
+    onMouseMove={e => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const mx2 = e.clientX - rect.left - padL;
+      const idx = Math.floor(mx2 / (bw + 1));
+      if (idx >= 0 && idx < disp.length) setHover(idx); else setHover(null);
+    }}
+    onMouseLeave={() => setHover(null)}>
+    {/* Grid */}
+    {yLabels.map((yl, i) => <g key={i}><line x1={padL} y1={yl.y} x2={w} y2={yl.y} stroke={T.ghost} /><text x={2} y={yl.y + 3} fill={T.muted} fontSize={9} fontFamily="Manrope">{yl.label}</text></g>)}
+    {/* Candles */}
     {disp.map((c, i) => {
-      const x = 40 + i * (bw + 1), bull = c.c >= c.o, col = bull ? T.green : T.red;
+      const x = padL + i * (bw + 1), bull = c.c >= c.o, col = bull ? T.green : T.red;
       const top = toY(Math.max(c.o, c.c)), bot = toY(Math.min(c.o, c.c));
       const isSig = signals.some(s => s.idx === si + i);
-      return (<g key={i}><line x1={x + bw / 2} y1={toY(c.h)} x2={x + bw / 2} y2={toY(c.l)} stroke={col} strokeWidth={1} /><rect x={x} y={top} width={bw} height={Math.max(1, bot - top)} fill={col} />{isSig && <><circle cx={x + bw / 2} cy={toY(c.h) - 10} r={5} fill={T.gold} /><text x={x + bw / 2} y={toY(c.h) - 7} textAnchor="middle" fill={T.darker} fontSize={7} fontWeight={700}>IB</text></>}</g>);
+      const isHov = hover === i;
+      return (<g key={i}>
+        <line x1={x + bw / 2} y1={toY(c.h)} x2={x + bw / 2} y2={toY(c.l)} stroke={col} strokeWidth={1} />
+        <rect x={x} y={top} width={bw} height={Math.max(1, bot - top)} fill={col} opacity={isHov ? 1 : 0.85} />
+        {isHov && <rect x={x - 1} y={top - 1} width={bw + 2} height={Math.max(3, bot - top + 2)} fill="none" stroke={T.gold} strokeWidth={2} />}
+        {isSig && <><circle cx={x + bw / 2} cy={toY(c.h) - 10} r={5} fill={T.gold} /><text x={x + bw / 2} y={toY(c.h) - 7} textAnchor="middle" fill={T.darker} fontSize={7} fontWeight={700}>●</text></>}
+      </g>);
     })}
+    {/* Date labels */}
+    {dateLabels.map((dl, i) => <text key={i} x={dl.x} y={h - 4} fill={T.muted} fontSize={8} fontFamily="Manrope" textAnchor="middle">{dl.label}</text>)}
+    {/* Hover tooltip */}
+    {hover !== null && disp[hover] && (() => {
+      const c = disp[hover], x = padL + hover * (bw + 1), dt = new Date(c.t);
+      const tx = Math.min(x + 10, w - 155), ty = 10;
+      return (<g>
+        <line x1={x + bw / 2} y1={0} x2={x + bw / 2} y2={ch} stroke={T.gold} strokeWidth={1} strokeDasharray="3,3" />
+        <rect x={tx} y={ty} width={148} height={76} rx={2} fill={T.darker} opacity={0.95} />
+        <text x={tx + 8} y={ty + 14} fill={T.gold} fontSize={10} fontFamily="Manrope" fontWeight={700}>{dt.toLocaleDateString("es-MX", { month: "short", day: "numeric", year: "numeric" })} {dt.toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" })}</text>
+        <text x={tx + 8} y={ty + 29} fill="#aaa" fontSize={9} fontFamily="Manrope">O: ${c.o.toFixed(2)}  H: ${c.h.toFixed(2)}</text>
+        <text x={tx + 8} y={ty + 43} fill="#aaa" fontSize={9} fontFamily="Manrope">L: ${c.l.toFixed(2)}  C: ${c.c.toFixed(2)}</text>
+        <text x={tx + 8} y={ty + 57} fill="#aaa" fontSize={9} fontFamily="Manrope">Vol: {(c.v / 1000).toFixed(0)}K</text>
+        <text x={tx + 8} y={ty + 70} fill={c.c >= c.o ? T.green : T.red} fontSize={9} fontFamily="Manrope" fontWeight={700}>{((c.c - c.o) / c.o * 100).toFixed(2)}%</text>
+      </g>);
+    })()}
   </svg>);
 }
 
@@ -243,7 +495,7 @@ const X = {
   tag: { background: T.bgLow, color: T.black, borderRadius: 2, padding: "5px 10px", fontSize: 12, fontWeight: 500, display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "'Manrope'" },
   badge: d => ({ background: d === "LONG" ? T.greenBg : d === "SHORT" ? T.redBg : T.bgLow, color: d === "LONG" ? T.green : d === "SHORT" ? T.red : T.grey, borderRadius: 2, padding: "3px 8px", fontSize: 10, fontWeight: 700, letterSpacing: ".04em", textTransform: "uppercase" }),
 };
-const NAV = [{ id: "dashboard", l: "Dashboard", ic: "◈" }, { id: "trading", l: "Inside Bar", ic: "↗" }, { id: "backtesting", l: "Backtesting", ic: "⟳" }, { id: "comparator", l: "Comparador", ic: "⚖" }, { id: "portfolio", l: "Portfolio", ic: "◎" }, { id: "settings", l: "Configuración", ic: "⚙" }];
+const NAV = [{ id: "dashboard", l: "Dashboard", ic: "◈" }, { id: "trading", l: "Estrategias", ic: "↗" }, { id: "backtesting", l: "Backtesting", ic: "⟳" }, { id: "comparator", l: "Comparador", ic: "⚖" }, { id: "portfolio", l: "Portfolio", ic: "◎" }, { id: "settings", l: "Configuración", ic: "⚙" }];
 
 // ════════════════════════════════════════
 // APP
@@ -266,7 +518,10 @@ export default function GNZTrading() {
   const pos = conn && livePos.length > 0 ? livePos : simPos;
 
   // Strategy
-  const [par, setPar] = useState({ syms: ["AAPL", "TSLA", "NVDA"], tf: "1Day", atrP: 14, slM: 1.5, tpM: 3, volF: true, conf: true, minB: .5, risk: 2 });
+  const [par, setPar] = useState({ syms: ["AAPL", "TSLA", "NVDA"], tf: "1Day", atrP: 14, slM: 1.5, tpM: 3, volF: true, conf: true, minB: .5, risk: 2, emaFast: 9, emaSlow: 21, rsiPeriod: 14, rsiOS: 30, rsiOB: 70 });
+  const [activeStrategy, setActiveStrategy] = useState("Inside Bar");
+  const [riskMgmt, setRiskMgmt] = useState(RISK_DEFAULTS);
+  const [telegramCfg, setTelegramCfg] = useState({ token: "8741188551:AAGzsQbtuj6vDROVYpUPq8g3RPpGJK8qzHw", chatId: "8444348354", enabled: true });
   const [nSym, setNSym] = useState("");
   const [scanning, setScanning] = useState(false);
   const [trigs, setTrigs] = useState([]);
@@ -290,6 +545,7 @@ export default function GNZTrading() {
   const [btPeriodMode, setBtPeriodMode] = useState("dates"); // "dates" | "bars"
   const [btFull, setBtFull] = useState(null);
   const [btRunning, setBtRunning] = useState(false);
+  const [btStrategy, setBtStrategy] = useState("Inside Bar");
   const [btDataSource, setBtDataSource] = useState(null); // "alpaca" | "simulated"
   const [btError, setBtError] = useState(null);
   const [aiMsgs, setAiMsgs] = useState([]);
@@ -373,9 +629,14 @@ export default function GNZTrading() {
       let candles;
       if (client.current) { try { const d = await client.current.bars(sym, par.tf, 200); if (d.bars?.length > 10) candles = d.bars.map(b => ({ t: b.t, o: +b.o, h: +b.h, l: +b.l, c: +b.c, v: +b.v })); } catch {} }
       if (!candles) candles = simCandles(sym, 200, par.tf);
-      const sigs = detectIB(candles, par);
-      if (sigs.length) { const ls = sigs[sigs.length - 1]; lv.push({ sym, tf: par.tf, high: ls.mh, low: ls.ml, entry: ls.entry, cnt: sigs.length }); }
-      sigs.slice(-3).forEach(s => tg.push({ id: Date.now() + Math.random(), sym, dir: s.dir, entry: s.entry, sl: s.sl, tp: s.tp, rr: s.rr, tf: par.tf, type: s.dir === "LONG" ? "Ruptura Superior" : "Ruptura Inferior", ago: `Hace ${Math.floor(Math.random() * 45 + 2)} min`, status: "PENDING" }));
+      const sigs = runStrategy(activeStrategy, candles, par);
+      if (sigs.length) { const ls = sigs[sigs.length - 1]; lv.push({ sym, tf: par.tf, high: ls.mh, low: ls.ml, entry: ls.entry, cnt: sigs.length, strategy: activeStrategy }); }
+      sigs.slice(-3).forEach(s => {
+        const trig = { id: Date.now() + Math.random(), sym, dir: s.dir, entry: s.entry, sl: s.sl, tp: s.tp, rr: s.rr, tf: par.tf, type: s.strategy || activeStrategy, ago: `Hace ${Math.floor(Math.random() * 45 + 2)} min`, status: "PENDING", strategy: s.strategy || activeStrategy };
+        tg.push(trig);
+        // Send Telegram notification
+        if (telegramCfg.enabled) sendTelegram(PROXY, telegramCfg.token, telegramCfg.chatId, { ...trig, sym });
+      });
       setBt(backtest(candles, sigs, acct ? +acct.equity : 1e5, par.risk / 100));
       lastC = candles; lastS = sigs;
     }
@@ -639,7 +900,7 @@ export default function GNZTrading() {
             <div style={X.card}><div style={{ ...X.serif, fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Backtest</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>{[{ l: "Trades", v: bt.tot }, { l: "Win Rate", v: `${bt.wr}%`, c: bt.wr >= 50 ? T.green : T.red }, { l: "P.Factor", v: bt.pf, c: bt.pf >= 1.5 ? T.green : T.gold }, { l: "Max DD", v: `${bt.md}%`, c: bt.md < 15 ? T.green : T.red }, { l: "Sharpe", v: bt.sharpe, c: bt.sharpe >= 1 ? T.green : T.grey }, { l: "Return", v: `${bt.ret > 0 ? "+" : ""}${bt.ret}%`, c: bt.ret >= 0 ? T.green : T.red }].map((m, i) => <div key={i} style={{ background: T.bgLow, borderRadius: 2, padding: 12, textAlign: "center" }}><div style={X.lbl}>{m.l}</div><div style={{ ...X.serif, fontSize: 20, fontWeight: 700, color: m.c || T.black, marginTop: 4 }}>{m.v}</div></div>)}</div>
             </div>
-            <div style={X.card}><div style={{ ...X.serif, fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Equity Curve</div><LineChart data={bt.eq} w={380} h={160} /></div>
+            <div style={X.card}><div style={{ ...X.serif, fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Equity Curve</div><LineChart data={bt.eq} w={380} h={160} showDates={true} /></div>
           </div>}
           {trigs.length > 0 && <div>
             <div style={{ ...X.serif, fontSize: 20, fontWeight: 700, fontStyle: "italic", marginBottom: 12 }}>Disparadores</div>
@@ -805,6 +1066,7 @@ export default function GNZTrading() {
                   { l: "Avg Win", v: `$${btFull.avgWin.toLocaleString()}`, c: T.green },
                   { l: "Avg Loss", v: `$${btFull.avgLoss.toLocaleString()}`, c: T.red },
                   { l: "Expectancy", v: `$${btFull.expectancy.toLocaleString()}`, c: btFull.expectancy >= 0 ? T.green : T.red },
+                  { l: "Avg Hold", v: `${btFull.avgBarsHeld} barras`, c: T.black },
                 ].map((m, i) => (
                   <div key={i} style={{ background: T.bgLow, borderRadius: 2, padding: "14px 16px" }}>
                     <div style={{ ...X.lbl, fontSize: 9 }}>{m.l}</div>
@@ -818,7 +1080,7 @@ export default function GNZTrading() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
               <div style={X.card}>
                 <div style={{ ...X.serif, fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Equity Curve</div>
-                <LineChart data={btFull.eq} w={440} h={180} color={btFull.ret >= 0 ? T.green : T.red} />
+                <LineChart data={btFull.eq} w={440} h={180} color={btFull.ret >= 0 ? T.green : T.red} showDates={true} />
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 11, color: T.grey }}>
                   <span>Inicio: ${btFull.cap0.toLocaleString()}</span>
                   <span style={{ color: btFull.capF >= btFull.cap0 ? T.green : T.red, fontWeight: 600 }}>Final: ${btFull.capF.toLocaleString()}</span>
@@ -826,7 +1088,7 @@ export default function GNZTrading() {
               </div>
               <div style={X.card}>
                 <div style={{ ...X.serif, fontSize: 16, fontWeight: 700, marginBottom: 12 }}>Drawdown %</div>
-                <LineChart data={btFull.ddCurve} w={440} h={180} color={T.red} area={true} />
+                <LineChart data={btFull.ddCurve} w={440} h={180} color={T.red} area={true} showDates={true} />
                 <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, fontSize: 11, color: T.grey }}>
                   <span>Max: <span style={{ color: T.red, fontWeight: 600 }}>{btFull.md}%</span></span>
                   <span>{btFull.tot} trades analizados</span>
@@ -851,34 +1113,51 @@ export default function GNZTrading() {
             <div style={X.card}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
                 <div style={{ ...X.serif, fontSize: 18, fontWeight: 700 }}>Historial de <span style={{ fontStyle: "italic" }}>Trades</span></div>
-                <span style={{ fontSize: 11, color: T.grey }}>{btFull.trades.length} operaciones</span>
+                <div style={{ display: "flex", gap: 16, fontSize: 11, color: T.grey }}>
+                  <span>{btFull.trades.length} operaciones</span>
+                  <span>Avg hold: {btFull.avgBarsHeld} barras</span>
+                </div>
               </div>
               <div style={{ maxHeight: 500, overflow: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
                   <thead>
                     <tr style={{ borderBottom: `2px solid ${T.ghost}`, color: T.grey, position: "sticky", top: 0, background: T.white }}>
-                      {["#", "Fecha", "Tipo", "Entrada", "Salida", "PnL %", "Capital", "Drawdown %"].map(h => (
-                        <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontWeight: 700, fontSize: 10, letterSpacing: ".08em", textTransform: "uppercase" }}>{h}</th>
+                      {["#", "Fecha Entrada", "Fecha Salida", "Tipo", "Shares", "Entrada", "SL", "TP", "Salida", "Resultado", "PnL $", "PnL Precio %", "Impacto Port. %", "Capital", "Drawdown %", "Barras"].map(h => (
+                        <th key={h} style={{ padding: "8px 6px", textAlign: "left", fontWeight: 700, fontSize: 9, letterSpacing: ".06em", textTransform: "uppercase", whiteSpace: "nowrap" }}>{h}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
                     {btFull.trades.map((t, i) => (
-                      <tr key={i} style={{ borderBottom: `1px solid ${T.ghost}`, background: t.result === "TP" ? "rgba(45,122,58,.03)" : "rgba(198,40,40,.03)" }}>
-                        <td style={{ padding: "7px 10px", color: T.muted }}>{t.num}</td>
-                        <td style={{ padding: "7px 10px", fontSize: 11 }}>{new Date(t.date).toLocaleString("es-MX", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</td>
-                        <td style={{ padding: "7px 10px" }}>
+                      <tr key={i} style={{ borderBottom: `1px solid ${T.ghost}`, background: t.result === "TP" || t.result === "WIN" ? "rgba(45,122,58,.04)" : "rgba(198,40,40,.04)" }}>
+                        <td style={{ padding: "6px", color: T.muted }}>{t.num}</td>
+                        <td style={{ padding: "6px", fontSize: 11 }}>{new Date(t.date).toLocaleDateString("es-MX", { month: "2-digit", day: "2-digit", year: "2-digit" })}</td>
+                        <td style={{ padding: "6px", fontSize: 11 }}>{new Date(t.exitDate).toLocaleDateString("es-MX", { month: "2-digit", day: "2-digit", year: "2-digit" })}</td>
+                        <td style={{ padding: "6px" }}>
                           <span style={{ ...X.badge(t.type === "BUY" ? "LONG" : "SHORT"), fontSize: 9 }}>{t.type}</span>
                         </td>
-                        <td style={{ padding: "7px 10px", fontWeight: 600 }}>${t.entry}</td>
-                        <td style={{ padding: "7px 10px", fontWeight: 600 }}>${t.exit}</td>
-                        <td style={{ padding: "7px 10px", fontWeight: 700, color: t.pnlPct >= 0 ? T.green : T.red }}>
+                        <td style={{ padding: "6px", fontWeight: 600 }}>{t.size}</td>
+                        <td style={{ padding: "6px", fontWeight: 600 }}>${t.entry}</td>
+                        <td style={{ padding: "6px", color: T.red, fontSize: 11 }}>${t.sl}</td>
+                        <td style={{ padding: "6px", color: T.green, fontSize: 11 }}>${t.tp}</td>
+                        <td style={{ padding: "6px", fontWeight: 600 }}>${t.exit}</td>
+                        <td style={{ padding: "6px" }}>
+                          <span style={{ padding: "2px 6px", borderRadius: 2, fontSize: 9, fontWeight: 700, background: t.result === "TP" || t.result === "WIN" ? T.greenBg : T.redBg, color: t.result === "TP" || t.result === "WIN" ? T.green : T.red }}>{t.result}</span>
+                        </td>
+                        <td style={{ padding: "6px", fontWeight: 700, color: t.pnlAbs >= 0 ? T.green : T.red }}>
+                          {t.pnlAbs >= 0 ? "+" : ""}${t.pnlAbs.toLocaleString()}
+                        </td>
+                        <td style={{ padding: "6px", color: t.pnlPct >= 0 ? T.green : T.red }}>
                           {t.pnlPct >= 0 ? "+" : ""}{t.pnlPct}%
                         </td>
-                        <td style={{ padding: "7px 10px", fontWeight: 600 }}>${t.capital.toLocaleString()}</td>
-                        <td style={{ padding: "7px 10px", color: t.drawdown < -5 ? T.red : t.drawdown < 0 ? T.gold : T.green, fontWeight: 600 }}>
+                        <td style={{ padding: "6px", fontWeight: 700, color: t.pnlPortPct >= 0 ? T.green : T.red }}>
+                          {t.pnlPortPct >= 0 ? "+" : ""}{t.pnlPortPct}%
+                        </td>
+                        <td style={{ padding: "6px", fontWeight: 600 }}>${t.capital.toLocaleString()}</td>
+                        <td style={{ padding: "6px", color: t.drawdown < -5 ? T.red : t.drawdown < 0 ? T.gold : T.green, fontWeight: 600 }}>
                           {t.drawdown.toFixed(2)}%
                         </td>
+                        <td style={{ padding: "6px", color: T.grey }}>{t.barsHeld}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -965,6 +1244,62 @@ export default function GNZTrading() {
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}><span style={{ fontSize: 20 }}>◎</span><div><div style={{ fontSize: 16, fontWeight: 700 }}>Anthropic AI</div><div style={{ fontSize: 10, color: T.grey }}>Cognitive Analysis Engine</div></div></div>
               <div style={{ marginBottom: 16 }}><div style={X.lbl}>API Key</div><div style={{ display: "flex", gap: 8 }}><input style={X.inp} type={showK2 ? "text" : "password"} placeholder="sk-ant-..." value={keys.aiK} onChange={e => setKeys(p => ({ ...p, aiK: e.target.value }))} /><span style={{ cursor: "pointer" }} onClick={() => setSK2(!showK2)}>⚡</span></div></div>
               <div style={{ padding: 12, background: keys.aiK ? T.greenBg : T.bgLow, borderRadius: 2, fontSize: 12 }}>{keys.aiK ? <span style={{ color: T.green }}>✓ Key configurada</span> : <span style={{ color: T.grey }}>Sin key — modo demo activo</span>}</div>
+            </div>
+          </div>
+          {/* Telegram + Risk Management row */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
+            {/* Telegram */}
+            <div style={X.card}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                <span style={{ fontSize: 20 }}>📨</span>
+                <div>
+                  <div style={{ fontSize: 16, fontWeight: 700 }}>Telegram Alerts</div>
+                  <div style={{ fontSize: 10, color: telegramCfg.enabled ? T.green : T.grey, fontWeight: 600 }}>{telegramCfg.enabled ? "● Activo" : "○ Inactivo"}</div>
+                </div>
+                <div style={{ marginLeft: "auto", width: 40, height: 22, borderRadius: 11, background: telegramCfg.enabled ? T.gold : T.bgHigh, position: "relative", cursor: "pointer" }} onClick={() => setTelegramCfg(p => ({ ...p, enabled: !p.enabled }))}>
+                  <div style={{ width: 16, height: 16, borderRadius: 8, background: T.white, position: "absolute", top: 3, left: telegramCfg.enabled ? 21 : 3, transition: "left .2s", boxShadow: "0 1px 3px rgba(0,0,0,.15)" }} />
+                </div>
+              </div>
+              <div style={{ marginBottom: 12 }}><div style={X.lbl}>Bot Token</div><input style={X.inp} type="password" placeholder="7123456789:AAH..." value={telegramCfg.token} onChange={e => setTelegramCfg(p => ({ ...p, token: e.target.value }))} /></div>
+              <div style={{ marginBottom: 12 }}><div style={X.lbl}>Chat ID</div><input style={X.inp} placeholder="123456789" value={telegramCfg.chatId} onChange={e => setTelegramCfg(p => ({ ...p, chatId: e.target.value }))} /></div>
+              <button style={{ ...X.bo, width: "100%", marginBottom: 8 }} onClick={async () => {
+                if (!telegramCfg.token || !telegramCfg.chatId) return alert("Ingresa token y Chat ID");
+                try {
+                  const r = await fetch(`${PROXY}/api/telegram/test`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: telegramCfg.token, chatId: telegramCfg.chatId }) });
+                  const d = await r.json();
+                  if (d.ok) alert("✓ Mensaje de prueba enviado a Telegram!");
+                  else alert("Error: " + (d.error || "fallo"));
+                } catch (e) { alert("Error: " + e.message); }
+              }}>📨 Enviar Prueba</button>
+              <div style={{ fontSize: 10, color: T.muted, lineHeight: 1.5 }}>
+                1. Abre Telegram → @BotFather → /newbot<br />
+                2. Busca @userinfobot para tu Chat ID<br />
+                3. Cuando el escáner detecte señales, recibirás alertas
+              </div>
+            </div>
+            {/* Risk Management Defaults */}
+            <div style={X.card}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+                <span style={{ fontSize: 20 }}>🛡</span>
+                <div><div style={{ fontSize: 16, fontWeight: 700 }}>Risk Management</div><div style={{ fontSize: 10, color: T.grey }}>Protecciones por default (ON)</div></div>
+              </div>
+              {[
+                { k: "trailingSL", l: "Trailing Stop Loss", d: "Mueve SL conforme el precio avanza a tu favor" },
+                { k: "maxDailyLoss", l: "Max Daily Loss (5%)", d: "Detiene la estrategia si pierdes 5% en un día" },
+                { k: "maxConsecLoss", l: "Max 3 Pérdidas Seguidas", d: "Pausa después de 3 losses consecutivos" },
+                { k: "posSizeCap", l: "Position Cap (50%)", d: "Nunca más del 50% del capital en una posición" },
+                { k: "breakEven", l: "Break-Even Move", d: "Mueve SL a entry después de +1% ganancia" },
+              ].map((item, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: i < 4 ? `1px solid ${T.ghost}` : "none" }}>
+                  <div>
+                    <div style={{ fontSize: 13 }}>{item.l}</div>
+                    <div style={{ fontSize: 10, color: T.muted }}>{item.d}</div>
+                  </div>
+                  <div style={{ width: 40, height: 22, borderRadius: 11, background: riskMgmt[item.k] ? T.green : T.bgHigh, position: "relative", cursor: "pointer", flexShrink: 0 }} onClick={() => setRiskMgmt(p => ({ ...p, [item.k]: !p[item.k] }))}>
+                    <div style={{ width: 16, height: 16, borderRadius: 8, background: T.white, position: "absolute", top: 3, left: riskMgmt[item.k] ? 21 : 3, transition: "left .2s", boxShadow: "0 1px 3px rgba(0,0,0,.15)" }} />
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
           <div style={{ ...X.card, background: T.yellowLight }}>
